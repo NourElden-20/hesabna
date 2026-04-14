@@ -13,9 +13,9 @@ class AuthController extends Controller
     {
         $request->validate([
             'name'     => 'required|string|max:255',
-            'email'    => 'required|email|unique:users',
+            'email'    => 'required|email|unique:users,email',
             'password' => 'required|string|min:6',
-            'phone'    => 'required|string|unique:users',
+            'phone'    => 'required|string|unique:users,phone',
         ]);
 
         $user = User::create([
@@ -43,7 +43,7 @@ class AuthController extends Controller
 
         if (!Auth::attempt(['email' => $request->email, 'password' => $request->password])) {
             return response()->json([
-                'message' => 'Invalid Information',
+                'message' => 'بيانات الدخول غير صحيحة',
             ], 401);
         }
 
@@ -51,7 +51,7 @@ class AuthController extends Controller
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
-            'message' => 'Login Success',
+            'message' => 'تم تسجيل الدخول بنجاح',
             'token'   => $token,
             'user'    => $user,
         ]);
@@ -62,7 +62,7 @@ class AuthController extends Controller
         $request->user()->tokens()->delete();
 
         return response()->json([
-            'message' => 'Loout Success',
+            'message' => 'تم تسجيل الخروج بنجاح',
         ]);
     }
 

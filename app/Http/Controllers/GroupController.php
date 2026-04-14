@@ -2,15 +2,15 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Expense;
+use App\Models\ExpenseSplit;
 use App\Models\Group;
 use App\Models\GroupGuest;
 use App\Models\GroupMember;
+use App\Models\Settlement;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
-use App\Models\Expense;
-use App\Models\ExpenseSplit;
-use App\Models\Settlement;
 
 class GroupController extends Controller
 {
@@ -18,13 +18,9 @@ class GroupController extends Controller
     {
         $user = $request->user();
 
-        // الجروبات اللي إنت عملتها
         $createdGroups = Group::where('created_by', $user->id)->get();
-
-        // الجروبات اللي إنت عضو فيها
         $memberGroups = $user->groups;
 
-        // دمجهم مع بعض من غير تكرار
         $allGroups = $createdGroups->merge($memberGroups)->unique('id')->values();
 
         return response()->json($allGroups);
@@ -34,7 +30,7 @@ class GroupController extends Controller
     {
         $request->validate([
             'name' => 'required|string|max:255',
-            'emoji' => 'nullable|string',
+            'emoji' => 'nullable|string|max:10',
         ]);
 
         $group = Group::create([
@@ -44,7 +40,6 @@ class GroupController extends Controller
             'invite_token' => Str::random(10),
         ]);
 
-        // ضيف المستخدم الحالي كعضو تلقائياً
         GroupMember::create([
             'group_id' => $group->id,
             'user_id' => $request->user()->id,
@@ -56,6 +51,7 @@ class GroupController extends Controller
     public function show(Request $request, $id)
     {
         $group = Group::with(['members', 'guests', 'expenses'])->findOrFail($id);
+        $this->ensureGroupAccess($request, $group);
 
         return response()->json($group);
     }
@@ -67,24 +63,23 @@ class GroupController extends Controller
         ]);
 
         $group = Group::findOrFail($id);
+        $this->ensureGroupAccess($request, $group);
 
-        // دور على المستخدم برقم الموبايل
         $user = User::where('phone', $request->phone)->first();
 
         if (! $user) {
             return response()->json([
-                'message' => 'المستخدم مش موجود — ممكن تضيفه كضيف',
+                'message' => 'المستخدم غير موجود، ممكن تضيفه كضيف',
             ], 404);
         }
 
-        // تأكد إنه مش عضو أصلاً
         $exists = GroupMember::where('group_id', $group->id)
             ->where('user_id', $user->id)
             ->exists();
 
         if ($exists) {
             return response()->json([
-                'message' => 'المستخدم عضو في الجروب أصلاً',
+                'message' => 'المستخدم عضو في الجروب بالفعل',
             ], 409);
         }
 
@@ -93,19 +88,18 @@ class GroupController extends Controller
             'user_id' => $user->id,
         ]);
 
-        return response()->json([
-            'message' => 'تم إضافة العضو بنجاح',
-        ]);
+        return response()->json(['message' => 'تم إضافة العضو بنجاح']);
     }
 
     public function addGuest(Request $request, $id)
     {
         $request->validate([
             'name' => 'required|string|max:255',
-            'phone' => 'nullable|string',
+            'phone' => 'nullable|string|max:30',
         ]);
 
         $group = Group::findOrFail($id);
+        $this->ensureGroupAccess($request, $group);
 
         $guest = GroupGuest::create([
             'group_id' => $group->id,
@@ -120,22 +114,17 @@ class GroupController extends Controller
     {
         $group = Group::where('invite_token', $token)->firstOrFail();
 
-        $user = $request->user();
-
-        // تأكد إنه مش عضو أصلاً
         $exists = GroupMember::where('group_id', $group->id)
-            ->where('user_id', $user->id)
+            ->where('user_id', $request->user()->id)
             ->exists();
 
         if ($exists) {
-            return response()->json([
-                'message' => 'إنت عضو في الجروب أصلاً',
-            ], 409);
+            return response()->json(['message' => 'أنت عضو في الجروب بالفعل'], 409);
         }
 
         GroupMember::create([
             'group_id' => $group->id,
-            'user_id' => $user->id,
+            'user_id' => $request->user()->id,
         ]);
 
         return response()->json([
@@ -144,83 +133,86 @@ class GroupController extends Controller
         ]);
     }
 
-    /**
-     * حساب صافي الأرصدة لكل أعضاء وضيوف الجروب
-     * المسار: GET /api/groups/{id}/balances
-     */
-    public function getBalances($id)
+    public function getBalances(Request $request, $id)
     {
-        try {
-            // جلب الجروب مع الأعضاء والضيوف
-            $group = Group::with(['members', 'guests'])->findOrFail($id);
-            $balances = [];
+        $group = Group::with(['members', 'guests'])->findOrFail($id);
+        $this->ensureGroupAccess($request, $group);
 
-            // 1. تجهيز القائمة: نضع رصيد مبدئي (0) لكل عضو وضيف
-            foreach ($group->members as $member) {
-                $balances['user_'.$member->id] = [
-                    'id' => $member->id,
-                    'name' => $member->name,
-                    'type' => 'member',
-                    'balance' => 0,
-                ];
-            }
+        $balances = [];
 
-            foreach ($group->guests as $guest) {
-                $balances['guest_'.$guest->id] = [
-                    'id' => $guest->id,
-                    'name' => $guest->name,
-                    'type' => 'guest',
-                    'balance' => 0,
-                ];
-            }
-
-            // 2. إضافة المبالغ التي دفعها الأشخاص (تزيد رصيدهم بالـ +)
-            $expenses = Expense::where('group_id', $id)->get();
-            foreach ($expenses as $expense) {
-                $key = $expense->paid_by_user_id ? 'user_'.$expense->paid_by_user_id : 'guest_'.$expense->paid_by_guest_id;
-                if (isset($balances[$key])) {
-                    $balances[$key]['balance'] += $expense->amount;
-                }
-            }
-
-            // 3. خصم المبالغ التي يجب عليهم دفعها (نصيبهم في التقسيم -)
-            $splits = ExpenseSplit::whereHas('expense', function ($query) use ($id) {
-                $query->where('group_id', $id);
-            })->get();
-
-            foreach ($splits as $split) {
-                $key = $split->user_id ? 'user_'.$split->user_id : 'guest_'.$split->guest_id;
-                if (isset($balances[$key])) {
-                    $balances[$key]['balance'] -= $split->amount;
-                }
-            }
-
-            // 4. أخذ التسويات (Settlements) في الاعتبار
-            $settlements = Settlement::where('group_id', $id)->get();
-            foreach ($settlements as $settlement) {
-                // الشخص اللي دفع (المديون سابقاً) رصيده بيزيد لأنه بيسدد اللي عليه
-                $fromKey = $settlement->from_user_id ? 'user_'.$settlement->from_user_id : 'guest_'.$settlement->from_guest_id;
-                // الشخص اللي استلم (الدائن سابقاً) رصيده بيقل لأنه استلم فلوسه خلاص
-                $toKey = $settlement->to_user_id ? 'user_'.$settlement->to_user_id : 'guest_'.$settlement->to_guest_id;
-
-                if (isset($balances[$fromKey])) {
-                    $balances[$fromKey]['balance'] += $settlement->amount;
-                }
-                if (isset($balances[$toKey])) {
-                    $balances[$toKey]['balance'] -= $settlement->amount;
-                }
-            }
-
-            return response()->json([
-                'status' => 'success',
-                'data' => array_values($balances),
-            ]);
-
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'حدث خطأ أثناء حساب الأرصدة: '.$e->getMessage(),
-            ], 500);
+        foreach ($group->members as $member) {
+            $balances['user_'.$member->id] = [
+                'id' => $member->id,
+                'name' => $member->name,
+                'type' => 'member',
+                'balance' => 0.0,
+            ];
         }
+
+        foreach ($group->guests as $guest) {
+            $balances['guest_'.$guest->id] = [
+                'id' => $guest->id,
+                'name' => $guest->name,
+                'type' => 'guest',
+                'balance' => 0.0,
+            ];
+        }
+
+        $expenses = Expense::where('group_id', $id)->get();
+        foreach ($expenses as $expense) {
+            $key = $expense->paid_by_user_id
+                ? 'user_'.$expense->paid_by_user_id
+                : 'guest_'.$expense->paid_by_guest_id;
+
+            if (isset($balances[$key])) {
+                $balances[$key]['balance'] += (float) $expense->amount;
+            }
+        }
+
+        $splits = ExpenseSplit::whereHas('expense', function ($query) use ($id) {
+            $query->where('group_id', $id);
+        })->get();
+
+        foreach ($splits as $split) {
+            $key = $split->user_id
+                ? 'user_'.$split->user_id
+                : 'guest_'.$split->guest_id;
+
+            if (isset($balances[$key])) {
+                $balances[$key]['balance'] -= (float) $split->amount;
+            }
+        }
+
+        $settlements = Settlement::where('group_id', $id)->get();
+        foreach ($settlements as $settlement) {
+            $fromKey = $settlement->from_user_id
+                ? 'user_'.$settlement->from_user_id
+                : 'guest_'.$settlement->from_guest_id;
+
+            $toKey = $settlement->to_user_id
+                ? 'user_'.$settlement->to_user_id
+                : 'guest_'.$settlement->to_guest_id;
+
+            if (isset($balances[$fromKey])) {
+                $balances[$fromKey]['balance'] += (float) $settlement->amount;
+            }
+            if (isset($balances[$toKey])) {
+                $balances[$toKey]['balance'] -= (float) $settlement->amount;
+            }
+        }
+
+        // تقريب + إزالة الضوضاء الصغيرة جدا
+        foreach ($balances as &$entry) {
+            $entry['balance'] = round((float) $entry['balance'], 2);
+            if (abs($entry['balance']) < 0.01) {
+                $entry['balance'] = 0.0;
+            }
+        }
+        unset($entry);
+
+        return response()->json([
+            'status' => 'success',
+            'data' => array_values($balances),
+        ]);
     }
 }

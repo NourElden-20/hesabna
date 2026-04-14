@@ -2,20 +2,24 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Settlement;
-use App\Models\ExpenseSplit;
 use App\Models\Group;
+use App\Models\Settlement;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 
 class SettlementController extends Controller
 {
-    /**
-     * تسجيل عملية دفع (تسوية) بين شخصين
-     */
     public function store(Request $request, $groupId)
     {
-        $request->validate([
+        if ($cached = $this->getIdempotencyResponse($request)) {
+            return $cached;
+        }
+
+        $group = Group::with(['members:id', 'guests:id,group_id'])->findOrFail($groupId);
+        $this->ensureGroupAccess($request, $group);
+
+        $data = $request->validate([
             'from_user_id'  => 'nullable|exists:users,id',
             'from_guest_id' => 'nullable|exists:group_guests,id',
             'to_user_id'    => 'nullable|exists:users,id',
@@ -23,41 +27,77 @@ class SettlementController extends Controller
             'amount'        => 'required|numeric|min:0.01',
         ]);
 
-        return DB::transaction(function () use ($request, $groupId) {
-            // 1. تسجيل عملية التسوية
+        $fromUser = $data['from_user_id'] ?? null;
+        $fromGuest = $data['from_guest_id'] ?? null;
+        $toUser = $data['to_user_id'] ?? null;
+        $toGuest = $data['to_guest_id'] ?? null;
+
+        // XOR from
+        if ((is_null($fromUser) && is_null($fromGuest)) || (!is_null($fromUser) && !is_null($fromGuest))) {
+            throw ValidationException::withMessages([
+                'from_user_id' => ['لازم تحدد دافع واحد فقط (عضو أو ضيف).'],
+            ]);
+        }
+
+        // XOR to
+        if ((is_null($toUser) && is_null($toGuest)) || (!is_null($toUser) && !is_null($toGuest))) {
+            throw ValidationException::withMessages([
+                'to_user_id' => ['لازم تحدد مستلم واحد فقط (عضو أو ضيف).'],
+            ]);
+        }
+
+        $fromKey = $fromUser ? 'u:'.$fromUser : 'g:'.$fromGuest;
+        $toKey = $toUser ? 'u:'.$toUser : 'g:'.$toGuest;
+
+        if ($fromKey === $toKey) {
+            throw ValidationException::withMessages([
+                'amount' => ['لا يمكن عمل تسوية لنفس الشخص.'],
+            ]);
+        }
+
+        $memberIds = $group->members->pluck('id')->map(fn($v) => (int)$v)->toArray();
+        $guestIds = $group->guests->pluck('id')->map(fn($v) => (int)$v)->toArray();
+
+        if ($fromUser && !in_array((int)$fromUser, $memberIds, true)) {
+            throw ValidationException::withMessages(['from_user_id' => ['العضو الدافع ليس ضمن هذا الجروب.']]);
+        }
+        if ($toUser && !in_array((int)$toUser, $memberIds, true)) {
+            throw ValidationException::withMessages(['to_user_id' => ['العضو المستلم ليس ضمن هذا الجروب.']]);
+        }
+        if ($fromGuest && !in_array((int)$fromGuest, $guestIds, true)) {
+            throw ValidationException::withMessages(['from_guest_id' => ['الضيف الدافع ليس ضمن هذا الجروب.']]);
+        }
+        if ($toGuest && !in_array((int)$toGuest, $guestIds, true)) {
+            throw ValidationException::withMessages(['to_guest_id' => ['الضيف المستلم ليس ضمن هذا الجروب.']]);
+        }
+
+        return DB::transaction(function () use ($request, $data, $groupId) {
             $settlement = Settlement::create([
                 'group_id'      => $groupId,
-                'from_user_id'  => $request->from_user_id,
-                'from_guest_id' => $request->from_guest_id,
-                'to_user_id'    => $request->to_user_id,
-                'to_guest_id'   => $request->to_guest_id,
-                'amount'        => $request->amount,
+                'from_user_id'  => $data['from_user_id'] ?? null,
+                'from_guest_id' => $data['from_guest_id'] ?? null,
+                'to_user_id'    => $data['to_user_id'] ?? null,
+                'to_guest_id'   => $data['to_guest_id'] ?? null,
+                'amount'        => $data['amount'],
             ]);
 
-            // 2. تحديث حالة الـ Splits (اختياري حسب منطق تطبيقك)
-            // ملاحظة: في أنظمة الديون المعقدة، التسوية عادة بتنزل من "إجمالي" الدين
-            // لكن لتبسيط الأمر، سنبحث عن الديون غير المسددة لهذا الشخص ونحولها لـ Settled
-            if ($request->from_user_id) {
-                ExpenseSplit::where('user_id', $request->from_user_id)
-                    ->where('is_settled', false)
-                    ->whereHas('expense', function($q) use ($groupId) {
-                        $q->where('group_id', $groupId);
-                    })
-                    ->update(['is_settled' => true]);
-            }
-
-            return response()->json([
+            // مهم: لا نعدل ExpenseSplit.is_settled هنا
+            $response = response()->json([
                 'message' => 'تم تسجيل التسوية بنجاح',
-                'settlement' => $settlement
+                'settlement' => $settlement,
             ], 201);
+
+            $this->storeIdempotencyResponse($request, $response);
+
+            return $response;
         });
     }
 
-    /**
-     * عرض تاريخ التسويات في الجروب
-     */
-    public function index($groupId)
+    public function index(Request $request, $groupId)
     {
+        $group = Group::findOrFail($groupId);
+        $this->ensureGroupAccess($request, $group);
+
         $settlements = Settlement::with(['fromUser', 'fromGuest', 'toUser', 'toGuest'])
             ->where('group_id', $groupId)
             ->latest()
